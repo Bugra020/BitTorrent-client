@@ -5,6 +5,17 @@
 4. make http get request
 5. ???
 """
-from bcoding import bencode, bdecode
+import logging
+from src import torrent
 
-file = open("", "r")
+
+class Main(object):
+
+    def __init__(self):
+        self.torrent = torrent.Torrent().load_from_path("test.torrent")
+
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.DEBUG)
+    main = Main()
