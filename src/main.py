@@ -15,7 +15,10 @@ from src import torrent
 class Main(object):
 
     def __init__(self):
-        self.torrent = torrent.Torrent().load_from_path("../test torrents/film.torrent")
+        self.start_time = None
+        self.download_speed = 0
+        self.downloaded_length = 0
+        self.torrent = torrent.Torrent().load_from_path("../test torrents/deneme.torrent")
         self.tracker_urls = self.torrent.announce_list
         self.info_hash = self.torrent.info_hash
         self.peer_id = self.torrent.peer_id
@@ -23,7 +26,6 @@ class Main(object):
         self.peer_list = []
 
     async def start(self):
-        """
         # getting the peers
         for tracker in self.tracker_urls:
             print(f"\n{tracker[0]}")
@@ -32,27 +34,9 @@ class Main(object):
             for tracker_peer in tracker_peer_list:
                 self.peer_list.append(tracker_peer)
 
-        print(f"all peeers:{self.peer_list}")
-        """
-        self.peer_list = [('46.236.132.30', 19162), ('109.104.46.131', 61270), ('109.104.48.26', 63486),
-                          ('188.18.33.56', 21084), ('188.0.144.6', 21237), ('185.15.62.105', 62762),
-                          ('178.218.103.8', 14511), ('178.65.85.119', 52240), ('176.105.196.92', 53996),
-                          ('164.138.91.95', 50237), ('145.255.0.16', 16523), ('109.188.76.17', 17345),
-                          ('109.169.147.102', 56979), ('109.126.5.100', 17320), ('95.32.91.161', 58649),
-                          ('95.24.221.100', 25240), ('94.75.26.249', 46759), ('94.19.44.32', 42018),
-                          ('93.185.70.210', 63090), ('92.126.117.218', 11640), ('91.243.107.2', 39986),
-                          ('91.232.47.35', 36901), ('89.109.45.84', 23698), ('88.200.245.144', 13225),
-                          ('85.73.175.248', 38628), ('85.15.109.30', 45005), ('81.25.70.137', 47316),
-                          ('78.40.106.4', 41967), ('77.239.215.227', 39954), ('77.82.164.122', 43000),
-                          ('46.174.81.138', 33179), ('46.147.175.43', 11455), ('45.159.16.146', 31783),
-                          ('37.140.12.209', 60115), ('31.200.239.9', 29749), ('31.173.170.183', 52463),
-                          ('31.135.45.11', 56021), ('31.15.23.107', 45966), ('5.228.80.194', 54819),
-                          ('5.189.46.116', 21227), ('5.149.159.34', 19604), ('5.34.112.15', 62263),
-                          ('5.8.219.115', 38420), ('217.199.228.163', 60309), ('213.137.65.217', 48018),
-                          ('213.87.246.187', 32472), ('212.96.74.37', 56223), ('194.226.6.254', 12817),
-                          ('194.110.52.153', 40507), ('193.105.126.254', 36084)]
+        print(f"all peers:{self.peer_list}")
 
-        # Connect to peers (gpt code)
+        # Connect to peers
         connections = []
         for peer in self.peer_list:
             connections.append(await self.connect_to_peer(peer[0], peer[1]))
@@ -61,17 +45,22 @@ class Main(object):
         print("\nSTARTING TO DOWNLOAD PIECES\n")
         piece_length = self.torrent.piece_length
         num_pieces = self.torrent.number_of_pieces
-        file_path = 'test torrents/downloaded_content.dat'
+        file_path = 'test torrents\downloaded_content.dat'
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
         # Create an empty file of the correct size
         with open(file_path, 'wb') as f:
             f.truncate(piece_length * num_pieces)
 
+        self.start_time = time.time()
+
         for conn in connections:
-            await self.download_and_save_pieces(conn[0], conn[1], file_path, num_pieces, piece_length)
-            conn[1].close()
-            await conn[1].wait_closed()
+            try:
+                await self.download_and_save_pieces(conn[0], conn[1], file_path, num_pieces, piece_length)
+                conn[1].close()
+                await conn[1].wait_closed()
+            except Exception as e:
+                pass
 
     def get_peers(self, announce):
         try:
@@ -263,7 +252,9 @@ class Main(object):
             print(f"couldn't connect to peer: {peer_ip}")
             return False
         return True
+
     async def request_piece(self, writer, index, begin, length):
+        print(f"requested the piece #{index} block #{begin / 16384}")
         request = b'\x00\x00\x00\x0d'  # Length of message
         request += b'\x06'  # Request message ID
         request += index.to_bytes(4, 'big')
@@ -275,10 +266,9 @@ class Main(object):
         for piece_index in range(total_pieces):
             piece_data = await self.download_piece(reader, writer, piece_index, piece_length)
             await self.save_piece(file_path, piece_index, piece_data, piece_length)
-            print(f"Piece #{piece_index} successfully downloaded & saved.")
 
     async def download_piece(self, reader, writer, piece_index, piece_length):
-        print(f"Started downloading piece: #{piece_index}")
+        print(f"Started downloading piece: #{piece_index}...")
         piece = bytearray(piece_length)
         begin = 0
         block_size = 16384  # 16 KB
@@ -287,13 +277,19 @@ class Main(object):
             length = min(block_size, piece_length - begin)
             await self.request_piece(writer, piece_index, begin, length)
 
-            # Expecting piece message (ID: 7)
             response = await reader.read(4 + 1 + 8 + length)
             piece[begin:begin + length] = response[-length:]
             begin += length
+            self.downloaded_length += length
+            await self.display_download_speed(self.start_time, length)
 
         print(f"successfully downloaded the piece #{piece_index}")
         return piece
+
+    async def display_download_speed(self, start, length):
+        elapsed_time = time.time() - start
+        speed = length / elapsed_time
+        print(f"Current download speed: {speed:.2f} bytes/second")
 
     async def save_piece(self, file_path, piece_index, piece_data, piece_length):
         offset = piece_index * piece_length
