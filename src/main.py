@@ -27,25 +27,24 @@ class Main(object):
 
     async def start(self):
         # getting the peers
-        for tracker in self.tracker_urls:
-            print(f"\n{tracker[0]}")
-            tracker_peer_list = self.get_peers(tracker[0][:-9])
-
-            for tracker_peer in tracker_peer_list:
-                self.peer_list.append(tracker_peer)
+        get_peers_tasks = [self.get_peers(tracker[0][:-9]) for tracker in self.tracker_urls]
+        tracker_peer_list = await asyncio.gather(*get_peers_tasks, return_exceptions=True)
+        for pl in tracker_peer_list:
+            if pl is not None:
+                for p in pl:
+                    self.peer_list.append(p)
 
         print(f"all peers:{self.peer_list}")
 
         # Connect to peers
-        connections = []
-        for peer in self.peer_list:
-            connections.append(await self.connect_to_peer(peer[0], peer[1]))
+        connect_peer_tasks = [self.connect_to_peer(peer[0], peer[1]) for peer in self.peer_list]
+        connections = await asyncio.gather(*connect_peer_tasks)
 
         # Download pieces
         print("\nSTARTING TO DOWNLOAD PIECES\n")
         piece_length = self.torrent.piece_length
         num_pieces = self.torrent.number_of_pieces
-        file_path = 'test torrents\downloaded_content.dat'
+        file_path = 'downloads\downloaded_content.dat'
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
         # Create an empty file of the correct size
@@ -62,12 +61,13 @@ class Main(object):
             except Exception as e:
                 pass
 
-    def get_peers(self, announce):
+    async def get_peers(self, announce):
         try:
             if announce.startswith('http://') or announce.startswith('https://'):
-                return self.get_http_peers(announce, self.info_hash, self.peer_id, self.port)
+                # return self.get_http_peers(announce, self.info_hash, self.peer_id, self.port)
+                pass
             elif announce.startswith('udp://'):
-                return self.get_udp_peers(announce, self.info_hash, self.peer_id, self.port)
+                return await self.get_udp_peers(announce, self.info_hash, self.peer_id, self.port)
             else:
                 raise ValueError("Unsupported tracker protocol")
         except ConnectionResetError as e:
@@ -110,7 +110,7 @@ class Main(object):
                 except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                     print(f"Attempt {attempt + 1} failed with error: {e}")
                     if attempt < retries - 1:
-                        time.sleep(1)  # Wait a bit before retrying
+                        asyncio.sleep(1)  # Wait a bit before retrying
                     else:
                         return []  # Return an empty list if all retries fail
 
@@ -118,7 +118,7 @@ class Main(object):
             print("Unexpected error occurred: ", e)
             return []
 
-    def get_udp_peers(self, announce, info_hash, peer_id, client_port, retries=3, timeout=5):
+    async def get_udp_peers(self, announce, info_hash, peer_id, client_port, retries=3, timeout=5):
         # Extract the host and port from the announce URL
         if announce.startswith('udp://'):
             announce = announce[6:]
@@ -129,32 +129,49 @@ class Main(object):
         # Resolve the hostname to an IP address
         ip_address = socket.gethostbyname(host)
 
+        # UDP socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        sock.setblocking(False)
+
+        # Connection request
+        """
+        connection_id = 0x41727101980  # Initial connection ID as per the protocol
+        transaction_id = random.randint(0, 0xFFFFFFFF)
+        connection_request = struct.pack('>QLL', connection_id, 0, transaction_id)
+        """
+
+        CONNECTION_ID = 0x41727101980
+        ACTION_CONNECT = 0
+        ACTION_ANNOUNCE = 1
+        PROTOCOL_ID = 0x41727101980
+
+        loop = asyncio.get_running_loop()
+
+        transaction_id = int(time.time()) & 0xFFFFFFFF
+        request_connection_id = struct.pack("!q", PROTOCOL_ID) + struct.pack("!i", ACTION_CONNECT) + struct.pack("!i", transaction_id)
+
         for attempt in range(retries):
             try:
-                # UDP socket
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.settimeout(timeout)
-
-                # Connection request
-                connection_id = 0x41727101980  # Initial connection ID as per the protocol
-                transaction_id = random.randint(0, 0xFFFFFFFF)
-                connection_request = struct.pack('>QLL', connection_id, 0, transaction_id)
 
                 # Send connection request
-                sock.sendto(connection_request, (ip_address, port))
+                # sock.sendto(connection_request, (ip_address, port))
+                await loop.sock_sendall(sock, request_connection_id)
 
                 # Receive connection response
-                response = sock.recv(16)
+                response = await loop.sock_recv(sock, 16)
+
                 if len(response) < 16:
                     raise Exception("Invalid connection response length")
 
-                action, res_transaction_id, connection_id = struct.unpack('>LLQ', response)
-                if action != 0 or res_transaction_id != transaction_id:
-                    raise Exception("Invalid connection response")
+                action, transaction_id, connection_id = struct.unpack("!iiq", response)
+
+                if action != ACTION_CONNECT:
+                    raise ValueError("Invalid action in response")
 
                 # Announce request
                 downloaded = 0
-                left = 0  # Change this to the actual size of the files to be downloaded
+                left = self.torrent.total_length  # Change this to the actual size of the files to be downloaded
                 uploaded = 0
                 event = 0  # 0: none; 1: completed; 2: started; 3: stopped
                 ip = 0
@@ -168,16 +185,19 @@ class Main(object):
                                                event, ip, key, num_want, client_port)
 
                 # Send announce request
-                sock.sendto(announce_request, (host, port))
+                # sock.sendto(announce_request, (host, port))
+                await loop.sock_sendall(sock, announce_request)
 
                 # Receive announce response
-                response = sock.recv(1024)
+                # response = sock.recv(1024)
+                response = await loop.sock_recv(sock, 2048)
+
                 if len(response) < 20:
                     raise Exception("Invalid announce response length")
 
                 action, res_transaction_id, interval, leechers, seeders = struct.unpack('>LLLll', response[:20])
-                if action != 1 or res_transaction_id != transaction_id:
-                    raise Exception("Invalid announce response")
+                if action != ACTION_CONNECT or res_transaction_id != transaction_id:
+                    raise ValueError("Invalid response from tracker")
 
                 peers = []
                 for i in range(20, len(response), 6):
@@ -191,7 +211,7 @@ class Main(object):
             except (socket.timeout, ConnectionResetError) as e:
                 print(f"Attempt {attempt + 1} failed with error: {e}")
                 if attempt < retries - 1:
-                    time.sleep(1)  # Wait a bit before retrying
+                    await asyncio.sleep(1)  # Wait a bit before retrying
                 else:
                     return []  # Return an empty list if all retries fail
             except Exception as e:
@@ -217,8 +237,10 @@ class Main(object):
                         print(f"Handshake with peer {peer_ip}, {peer_port} successful")
                         return reader, writer
                     else:
+                        print(f"Handshake with peer {peer_ip}, {peer_port} failed")
                         break
                 else:
+                    print(f"Handshake with peer {peer_ip}, {peer_port} couldn't complete")
                     break
             except asyncio.TimeoutError:
                 # Handle timeout: Retry connecting
